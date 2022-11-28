@@ -209,6 +209,7 @@ pub struct StoreStat {
     pub engine_last_used_size: u64,
     pub engine_last_available_size: u64,
     pub last_report_ts: UnixSecs,
+    pub force_report_count: u64,
 
     pub region_bytes_read: LocalHistogram,
     pub region_keys_read: LocalHistogram,
@@ -228,6 +229,7 @@ impl Default for StoreStat {
             region_bytes_written: REGION_WRITTEN_BYTES_HISTOGRAM.local(),
             region_keys_written: REGION_WRITTEN_KEYS_HISTOGRAM.local(),
 
+            force_report_count: 0,
             last_report_ts: UnixSecs::zero(),
             engine_total_bytes_read: 0,
             engine_total_keys_read: 0,
@@ -740,8 +742,8 @@ fn hotspot_query_num_report_threshold() -> u64 {
     HOTSPOT_QUERY_RATE_THRESHOLD * 10
 }
 
-/// Max limitation of delayed store_heartbeat.
-const STORE_HEARTBEAT_DELAY_LIMIT: u64 = 5 * 60;
+/// Max retry limitation of delayed store_heartbeat.
+const STORE_HEARTBEAT_DELAY_RETRY_LIMIT: u64 = 3;
 
 // Slow score is a value that represents the speed of a store and ranges in [1,
 // 100]. It is maintained in the AIMD way.
@@ -841,7 +843,8 @@ impl SlowScore {
     }
 
     fn should_force_report_slow_store(&self) -> bool {
-        self.value >= OrderedFloat(100.0) && (self.last_tick_id % self.round_ticks == 0)
+        let force_report_tick = self.round_ticks / 3; // limit to 5s one round.
+        self.value >= OrderedFloat(100.0) && (self.last_tick_id % force_report_tick == 0)
     }
 }
 
@@ -1282,11 +1285,17 @@ where
             .engine_last_query_num
             .fill_query_stats(&self.store_stat.engine_total_query_num);
         self.store_stat.last_report_ts = if store_info.is_some() {
+            // If `store_info` is Some(...), the given Task::StoreHeartbeat should be
+            // a normal heartbeat to PD, we should reset `force_report_count` and the
+            // timestamp of heartbeat.
+            self.store_stat.force_report_count = 0;
             UnixSecs::now()
         } else {
             // If `store_info` is None, the given Task::StoreHeartbeat should be a fake
             // heartbeat to PD, we won't update the last_report_ts to avoid incorrectly
-            // marking current TiKV node in normal state.
+            // marking current TiKV node in normal state. Meanwhile, we should incr()
+            // the `force_report_count`.
+            self.store_stat.force_report_count += 1;
             self.store_stat.last_report_ts
         };
         self.store_stat.region_bytes_written.flush();
@@ -1875,10 +1884,10 @@ where
     }
 
     fn is_store_heartbeat_delayed(&self) -> bool {
-        let now = UnixSecs::now();
-        let interval_second = now.into_inner() - self.store_stat.last_report_ts.into_inner();
+        let interval_second =
+            UnixSecs::now().into_inner() - self.store_stat.last_report_ts.into_inner();
         (interval_second >= self.store_heartbeat_interval.as_secs())
-            && (interval_second <= STORE_HEARTBEAT_DELAY_LIMIT)
+            && (self.store_stat.force_report_count < STORE_HEARTBEAT_DELAY_RETRY_LIMIT)
     }
 }
 
