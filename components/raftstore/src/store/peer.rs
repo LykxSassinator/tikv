@@ -20,7 +20,8 @@ use bytes::Bytes;
 use collections::{HashMap, HashSet};
 use crossbeam::{atomic::AtomicCell, channel::TrySendError};
 use engine_traits::{
-    Engines, KvEngine, PerfContext, RaftEngine, Snapshot, WriteBatch, WriteOptions, CF_LOCK,
+    Engines, KvEngine, PerfContext, RaftEngine, RefIterable, Snapshot, WriteBatch, WriteOptions,
+    CF_LOCK,
 };
 use error_code::ErrorCodeExt;
 use fail::fail_point;
@@ -1964,7 +1965,8 @@ where
         let has_snap_task = self.get_store().has_gen_snap_task();
         let pre_commit_index = self.raft_group.raft.raft_log.committed;
         self.raft_group.step(m)?;
-        self.report_commit_log_duration(pre_commit_index, &ctx.raft_metrics);
+        let now_commit_index = self.raft_group.raft.raft_log.committed;
+        self.report_commit_log_duration(ctx, pre_commit_index, now_commit_index);
 
         let mut for_balance = false;
         if !has_snap_task && self.get_store().has_gen_snap_task() {
@@ -2009,12 +2011,23 @@ where
         }
     }
 
-    fn report_commit_log_duration(&self, pre_commit_index: u64, metrics: &RaftMetrics) {
-        if !metrics.waterfall_metrics || self.proposals.is_empty() {
+    // TODO: report_commit_log_duration(..., ctx: &PollContext) to make it adaptive
+    // to report the commit log duration.
+    fn report_commit_log_duration<T>(
+        &self,
+        ctx: &mut PollContext<EK, ER, T>,
+        pre_commit_index: u64,
+        now_commit_index: u64,
+    ) {
+        if !ctx.raft_metrics.waterfall_metrics
+            || self.proposals.is_empty()
+            || pre_commit_index >= now_commit_index
+        {
             return;
         }
         let now = Instant::now();
-        for index in pre_commit_index + 1..=self.raft_group.raft.raft_log.committed {
+        let stat_raft_commit_log = &mut ctx.raft_metrics.stat_commit_log;
+        for index in pre_commit_index + 1..=now_commit_index {
             if let Some((term, trackers)) = self.proposals.find_trackers(index) {
                 if self
                     .get_store()
@@ -2024,19 +2037,25 @@ where
                 {
                     let commit_persisted = index <= self.raft_group.raft.raft_log.persisted;
                     let hist = if commit_persisted {
-                        &metrics.wf_commit_log
+                        &ctx.raft_metrics.wf_commit_log
                     } else {
-                        &metrics.wf_commit_not_persist_log
+                        &ctx.raft_metrics.wf_commit_not_persist_log
                     };
                     for tracker in trackers {
-                        tracker.observe(now, hist, |t| {
+                        // Collect the metrics related to commit_log
+                        // durations.
+                        stat_raft_commit_log.record(tracker.observe_and_return(now, hist, |t| {
                             t.metrics.commit_not_persisted = !commit_persisted;
                             &mut t.metrics.wf_commit_log_nanos
-                        });
+                        }));
                     }
                 }
             }
         }
+        // report commit log durations to the background pd worker.
+        // ? How? each log duration comes from `Peer`. How to notify
+        // it to `StoreFsm` ? Then, `StoreFsm` could accumulate them
+        // and notify the background pd worker to report it to PD.
     }
 
     /// Checks and updates `peer_heartbeats` for the peer.
@@ -3238,8 +3257,9 @@ where
             let pre_persist_index = self.raft_group.raft.raft_log.persisted;
             let pre_commit_index = self.raft_group.raft.raft_log.committed;
             self.raft_group.on_persist_ready(self.persisted_number);
+            let now_commit_index = self.raft_group.raft.raft_log.committed;
             self.report_persist_log_duration(pre_persist_index, &ctx.raft_metrics);
-            self.report_commit_log_duration(pre_commit_index, &ctx.raft_metrics);
+            self.report_commit_log_duration(ctx, pre_commit_index, now_commit_index);
 
             let persist_index = self.raft_group.raft.raft_log.persisted;
             self.mut_store().update_cache_persisted(persist_index);
@@ -3283,8 +3303,9 @@ where
         let pre_persist_index = self.raft_group.raft.raft_log.persisted;
         let pre_commit_index = self.raft_group.raft.raft_log.committed;
         let mut light_rd = self.raft_group.advance_append(ready);
+        let now_commit_index = self.raft_group.raft.raft_log.committed;
         self.report_persist_log_duration(pre_persist_index, &ctx.raft_metrics);
-        self.report_commit_log_duration(pre_commit_index, &ctx.raft_metrics);
+        self.report_commit_log_duration(ctx, pre_commit_index, now_commit_index);
 
         let persist_index = self.raft_group.raft.raft_log.persisted;
         if let Some(ForceLeaderState::ForceLeader { .. }) = self.force_leader {
