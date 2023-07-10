@@ -71,6 +71,14 @@ impl SampleWindow {
     }
 
     #[inline]
+    pub fn last(&self) -> Option<SampleValue> {
+        self.values.back().map(|val| SampleValue {
+            value: val.value,
+            time: val.time,
+        })
+    }
+
+    #[inline]
     pub fn avg(&self) -> f64 {
         if !self.values.is_empty() {
             self.sum as f64 / self.values.len() as f64
@@ -525,6 +533,11 @@ impl Trend {
     }
 
     #[inline]
+    pub fn last(&self) -> Option<f64> {
+        self.data_flow.windows[0].last().map(|val| val.value as f64)
+    }
+
+    #[inline]
     pub fn l0_avg(&self) -> f64 {
         self.data_flow.windows[0].avg()
     }
@@ -713,6 +726,7 @@ mod tests {
         assert_eq!(window.valid(), false);
         assert_eq!(window.avg(), 0.0);
         assert_eq!(window.std_ev_ratio(), 0.0);
+        assert!(window.last().is_none());
         window.record(10, now);
         assert_eq!(window.valid(), true);
         assert_eq!(window.avg(), 10.0);
