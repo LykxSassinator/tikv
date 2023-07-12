@@ -918,6 +918,60 @@ struct SlowTrend {
     punish_ratio: u64,
 }
 
+impl SlowTrend {
+    fn new(cfg: &Config) -> Self {
+        // Following `inspect_tick_ratio` is an sensitive ratio derived from
+        // `inspect_interval` in SlowScore, it's used to reduce or increase
+        // the sensitiveness of SlowTrend, just like `slow_trend_unsensitive_cause`.
+        let default_inspect_interval = Duration::from_millis(500).as_millis();
+        let inspect_interval = cfg.inspect_interval.0.as_millis();
+        let inspect_tick_ratio: f64 = if inspect_interval <= default_inspect_interval {
+            inspect_interval as f64 / default_inspect_interval as f64
+        } else {
+            default_inspect_interval as f64 / inspect_interval as f64
+        };
+        let convert_sampling_duration = |tick_ratio: f64, duration: Duration| {
+            Duration::from_millis((tick_ratio * duration.as_millis() as f64) as u64)
+        };
+        Self {
+            cause: Trend::new(
+                // Disable SpikeFilter for now
+                Duration::from_secs(0),
+                STORE_SLOW_TREND_MISC_GAUGE_VEC.with_label_values(&["spike_filter_value"]),
+                STORE_SLOW_TREND_MISC_GAUGE_VEC.with_label_values(&["spike_filter_count"]),
+                convert_sampling_duration(inspect_tick_ratio, Duration::from_secs(180)),
+                convert_sampling_duration(inspect_tick_ratio, Duration::from_secs(30)),
+                convert_sampling_duration(inspect_tick_ratio, Duration::from_secs(120)),
+                convert_sampling_duration(inspect_tick_ratio, Duration::from_secs(600)),
+                1,
+                tikv_util::time::duration_to_us(Duration::from_micros(500)),
+                STORE_SLOW_TREND_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC.with_label_values(&["L1"]),
+                STORE_SLOW_TREND_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC.with_label_values(&["L2"]),
+                cfg.slow_trend_unsensitive_cause,
+            ),
+            result: Trend::new(
+                // Disable SpikeFilter for now
+                Duration::from_secs(0),
+                STORE_SLOW_TREND_RESULT_MISC_GAUGE_VEC.with_label_values(&["spike_filter_value"]),
+                STORE_SLOW_TREND_RESULT_MISC_GAUGE_VEC.with_label_values(&["spike_filter_count"]),
+                convert_sampling_duration(inspect_tick_ratio, Duration::from_secs(120)),
+                convert_sampling_duration(inspect_tick_ratio, Duration::from_secs(15)),
+                convert_sampling_duration(inspect_tick_ratio, Duration::from_secs(60)),
+                convert_sampling_duration(inspect_tick_ratio, Duration::from_secs(300)),
+                1,
+                2000,
+                STORE_SLOW_TREND_RESULT_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC
+                    .with_label_values(&["L1"]),
+                STORE_SLOW_TREND_RESULT_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC
+                    .with_label_values(&["L2"]),
+                cfg.slow_trend_unsensitive_result,
+            ),
+            qps_recorder: RequestPerSecRecorder::new(),
+            punish_ratio: cfg.slow_trend_punish_ratio, // default is 0
+        }
+    }
+}
+
 pub struct Runner<EK, ER, T>
 where
     EK: KvEngine,
@@ -1013,44 +1067,7 @@ where
             snap_mgr,
             remote,
             slow_score: SlowScore::new(cfg.inspect_interval.0),
-            slow_trend: SlowTrend {
-                cause: Trend::new(
-                    // Disable SpikeFilter for now
-                    Duration::from_secs(0),
-                    STORE_SLOW_TREND_MISC_GAUGE_VEC.with_label_values(&["spike_filter_value"]),
-                    STORE_SLOW_TREND_MISC_GAUGE_VEC.with_label_values(&["spike_filter_count"]),
-                    Duration::from_secs(180),
-                    Duration::from_secs(30),
-                    Duration::from_secs(120),
-                    Duration::from_secs(600),
-                    1,
-                    tikv_util::time::duration_to_us(Duration::from_micros(500)),
-                    STORE_SLOW_TREND_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC.with_label_values(&["L1"]),
-                    STORE_SLOW_TREND_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC.with_label_values(&["L2"]),
-                    cfg.slow_trend_unsensitive_cause,
-                ),
-                result: Trend::new(
-                    // Disable SpikeFilter for now
-                    Duration::from_secs(0),
-                    STORE_SLOW_TREND_RESULT_MISC_GAUGE_VEC
-                        .with_label_values(&["spike_filter_value"]),
-                    STORE_SLOW_TREND_RESULT_MISC_GAUGE_VEC
-                        .with_label_values(&["spike_filter_count"]),
-                    Duration::from_secs(120),
-                    Duration::from_secs(15),
-                    Duration::from_secs(60),
-                    Duration::from_secs(300),
-                    1,
-                    2000,
-                    STORE_SLOW_TREND_RESULT_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC
-                        .with_label_values(&["L1"]),
-                    STORE_SLOW_TREND_RESULT_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC
-                        .with_label_values(&["L2"]),
-                    cfg.slow_trend_unsensitive_result,
-                ),
-                qps_recorder: RequestPerSecRecorder::new(),
-                punish_ratio: cfg.slow_trend_punish_ratio, // default is 0
-            },
+            slow_trend: SlowTrend::new(&cfg),
             health_service,
             curr_health_status: ServingStatus::Serving,
             coprocessor_host,
