@@ -1516,9 +1516,8 @@ where
     }
 
     fn handle_slow_trend_timeout(&mut self) {
-        // Update the SlowTrend (both slow_trend_cause & slow_trend_result)
-        // by inserting a fairy large value into it (on duration), to mark this tick is
-        // timeout.
+        // Update the SlowTrend by inserting a fairy large value into it (on duration),
+        // to mark this tick is timeout.
         if self.slow_trend.punish_ratio <= 1 {
             return;
         }
@@ -1530,13 +1529,8 @@ where
         } else {
             self.slow_trend.cause.record(1000_000 /* millisec */, now);
         }
-        let total_query_num = self.slow_trend.qps_recorder.record_and_get_current_rps(
-            self.store_stat.engine_last_query_num.get_all_query_num(),
-            Instant::now(),
-        );
-        if let Some(total_query_num) = total_query_num {
-            self.slow_trend.result.record(total_query_num as u64, now);
-        }
+        // TODO: move the SlowTrend(triggered by `commit-log-duration`) in
+        // raftstore-v2 to raftstore if necessary.
     }
 
     fn handle_report_batch_split(&self, regions: Vec<metapb::Region>) {

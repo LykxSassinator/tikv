@@ -1749,6 +1749,8 @@ fn future_raw_batch_put<E: Engine, L: LockManager, F: KvFormat>(
     };
 
     async move {
+        // TODO: add a broadcast channel to receive abort messages, making it
+        // can be canceled by
         let v = match res {
             Err(e) => Err(e),
             Ok(_) => f.await?,
