@@ -69,11 +69,8 @@ use raftstore::{
     },
     RaftRouterCompactedEventSender,
 };
-use resolved_ts::LeadershipResolver;
-use resource_control::{
-    worker::{GroupQuotaAdjustWorker, BACKGROUND_LIMIT_ADJUST_DURATION},
-    ResourceGroupManager, ResourceManagerService, MIN_PRIORITY_UPDATE_INTERVAL,
-};
+use resolved_ts::{LeadershipResolver, Task};
+use resource_control::ResourceGroupManager;
 use security::SecurityManager;
 use service::{service_event::ServiceEvent, service_manager::GrpcServiceManager};
 use snap_recovery::RecoveryService;
@@ -253,6 +250,7 @@ struct TikvServer<ER: RaftEngine, F: KvFormat> {
     causal_ts_provider: Option<Arc<CausalTsProviderImpl>>, // used for rawkv apiv2
     tablet_registry: Option<TabletRegistry<RocksEngine>>,
     br_snap_recovery_mode: bool, // use for br snapshot recovery
+    resolved_ts_scheduler: Option<Scheduler<Task>>,
     grpc_service_mgr: GrpcServiceManager,
 }
 
@@ -340,24 +338,13 @@ where
 
         let resource_manager = if config.resource_control.enabled {
             let mgr = Arc::new(ResourceGroupManager::default());
-            let mut resource_mgr_service =
-                ResourceManagerService::new(mgr.clone(), pd_client.clone());
-            // spawn a task to periodically update the minimal virtual time of all resource
-            // groups.
-            let resource_mgr = mgr.clone();
-            background_worker.spawn_interval_task(MIN_PRIORITY_UPDATE_INTERVAL, move || {
-                resource_mgr.advance_min_virtual_time();
-            });
-            // spawn a task to watch all resource groups update.
-            background_worker.spawn_async_task(async move {
-                resource_mgr_service.watch_resource_groups().await;
-            });
-            // spawn a task to auto adjust background quota limiter.
             let io_bandwidth = config.storage.io_rate_limit.max_bytes_per_sec.0;
-            let mut worker = GroupQuotaAdjustWorker::new(mgr.clone(), io_bandwidth);
-            background_worker.spawn_interval_task(BACKGROUND_LIMIT_ADJUST_DURATION, move || {
-                worker.adjust_quota();
-            });
+            resource_control::start_periodic_tasks(
+                &mgr,
+                pd_client.clone(),
+                &background_worker,
+                io_bandwidth,
+            );
             Some(mgr)
         } else {
             None
@@ -441,6 +428,7 @@ where
             causal_ts_provider,
             tablet_registry: None,
             br_snap_recovery_mode: is_recovering_marked,
+            resolved_ts_scheduler: None,
             grpc_service_mgr: GrpcServiceManager::new(tx),
         }
     }
@@ -646,6 +634,7 @@ where
             self.resource_manager
                 .as_ref()
                 .map(|m| m.derive_controller("scheduler-worker-pool".to_owned(), true)),
+            self.resource_manager.clone(),
         )
         .unwrap_or_else(|e| fatal!("failed to create raft storage: {}", e));
         cfg_controller.register(
@@ -800,6 +789,7 @@ where
                 self.concurrency_manager.clone(),
                 resource_tag_factory,
                 self.quota_limiter.clone(),
+                self.resource_manager.clone(),
             ),
             coprocessor_v2::Endpoint::new(&self.core.config.coprocessor_v2),
             self.resolver.clone().unwrap(),
@@ -1028,6 +1018,7 @@ where
                 server.env(),
                 self.security_mgr.clone(),
             );
+            self.resolved_ts_scheduler = Some(rts_worker.scheduler());
             rts_worker.start_with_timer(rts_endpoint);
             self.core.to_stop.push(rts_worker);
         }
@@ -1076,6 +1067,7 @@ where
             LocalTablets::Singleton(engines.engines.kv.clone()),
             servers.importer.clone(),
             None,
+            self.resource_manager.clone(),
         );
         let import_cfg_mgr = import_service.get_config_manager();
 
@@ -1093,10 +1085,27 @@ where
             .register(tikv::config::Module::Import, Box::new(import_cfg_mgr));
 
         // Debug service.
+        let resolved_ts_scheduler = Arc::new(self.resolved_ts_scheduler.clone());
         let debug_service = DebugService::new(
             servers.debugger.clone(),
             servers.server.get_debug_thread_pool().clone(),
             engines.engine.raft_extension(),
+            self.engines.as_ref().unwrap().store_meta.clone(),
+            Arc::new(
+                move |region_id, log_locks, min_start_ts, callback| -> bool {
+                    if let Some(s) = resolved_ts_scheduler.as_ref() {
+                        let res = s.schedule(Task::GetDiagnosisInfo {
+                            region_id,
+                            log_locks,
+                            min_start_ts,
+                            callback,
+                        });
+                        res.is_ok()
+                    } else {
+                        false
+                    }
+                },
+            ),
         );
         info!("start register debug service");
         if servers
@@ -1163,6 +1172,7 @@ where
             self.concurrency_manager.clone(),
             self.core.config.storage.api_version(),
             self.causal_ts_provider.clone(),
+            self.resource_manager.clone(),
         );
         self.cfg_controller.as_mut().unwrap().register(
             tikv::config::Module::Backup,
@@ -1496,12 +1506,7 @@ impl<CER: ConfiguredRaftEngine, F: KvFormat> TikvServer<CER, F> {
         &mut self,
         flow_listener: engine_rocks::FlowListener,
     ) -> (Engines<RocksEngine, CER>, Arc<EnginesResourceInfo>) {
-        let block_cache = self
-            .core
-            .config
-            .storage
-            .block_cache
-            .build_shared_cache(self.core.config.storage.engine);
+        let block_cache = self.core.config.storage.block_cache.build_shared_cache();
         let env = self
             .core
             .config
@@ -1619,10 +1624,8 @@ mod test {
         config.rocksdb.lockcf.soft_pending_compaction_bytes_limit = Some(ReadableSize(1));
         let env = Arc::new(Env::default());
         let path = Builder::new().prefix("test-update").tempdir().unwrap();
-        let cache = config
-            .storage
-            .block_cache
-            .build_shared_cache(config.storage.engine);
+        config.validate().unwrap();
+        let cache = config.storage.block_cache.build_shared_cache();
 
         let factory = KvEngineFactoryBuilder::new(env, &config, cache, None).build();
         let reg = TabletRegistry::new(Box::new(factory), path.path().join("tablets")).unwrap();
