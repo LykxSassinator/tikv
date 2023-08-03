@@ -2303,8 +2303,13 @@ where
             Task::QueryRegionLeader { region_id } => self.handle_query_region_leader(region_id),
             Task::UpdateSlowScore { id, duration } => {
                 self.slow_score.record(id, duration.sum());
+                // self.slow_trend.cause.record(
+                //     tikv_util::time::duration_to_us(duration.store_wait_duration.unwrap()),
+                //     Instant::now(),
+                // );
+                // TODO: use commit_log_duration to update SlowTrend.
                 self.slow_trend.cause.record(
-                    tikv_util::time::duration_to_us(duration.store_wait_duration.unwrap()),
+                    tikv_util::time::duration_to_us(duration.store_commit_duration.unwrap()),
                     Instant::now(),
                 );
             }
