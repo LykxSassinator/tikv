@@ -15,6 +15,8 @@ pub struct SlownessStatistics {
     slow_cause: Trend,
     /// Reactor as an assistant detector to detect the QPS jitters.
     slow_result: Trend,
+    // While noise to mitigate minor fluctuations.
+    white_noise: u64,
     slow_result_recorder: RequestPerSecRecorder,
     last_tick_finished: bool,
 }
@@ -55,6 +57,7 @@ impl SlownessStatistics {
                     .with_label_values(&["L2"]),
                 cfg.slow_trend_unsensitive_result,
             ),
+            white_noise: cfg.slow_trend_white_noise,
             slow_result_recorder: RequestPerSecRecorder::new(),
             last_tick_finished: true,
         }
@@ -105,11 +108,12 @@ where
         } else {
             // The following code records a periodic "white noise", which helps mitigate any
             // minor fluctuations in disk I/O or network I/O latency. After
-            // extensive e2e testing, a duration of "100ms" has been determined
+            // extensive e2e testing, a duration of "50ms" has been determined
             // to be the most suitable choice.
+            let white_noise = self.slowness_stats.white_noise;
             self.slowness_stats
                 .slow_cause
-                .record(100_000, Instant::now()); // 100ms
+                .record(white_noise, Instant::now()); // 50ms
         }
         // Move to the next tick.
         self.slowness_stats.last_tick_finished = false;

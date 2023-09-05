@@ -267,6 +267,7 @@ fn test_serde_custom_tikv_config() {
         check_request_snapshot_interval: ReadableDuration::minutes(1),
         slow_trend_unsensitive_cause: 10.0,
         slow_trend_unsensitive_result: 0.5,
+        slow_trend_white_noise: 50_000,
         enable_v2_compatible_learner: false,
         unsafe_disable_check_quorum: false,
     };
