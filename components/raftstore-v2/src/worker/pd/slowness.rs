@@ -35,7 +35,7 @@ impl SlownessStatistics {
                 Duration::from_secs(120),
                 Duration::from_secs(600),
                 1,
-                tikv_util::time::duration_to_us(Duration::from_micros(500)),
+                tikv_util::time::duration_to_us(Duration::from_micros(cfg.slow_trend_margin_error)),
                 STORE_SLOW_TREND_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC.with_label_values(&["L1"]),
                 STORE_SLOW_TREND_MARGIN_ERROR_WINDOW_GAP_GAUGE_VEC.with_label_values(&["L2"]),
                 cfg.slow_trend_unsensitive_cause,
