@@ -59,7 +59,6 @@ use crate::{
     store::{
         cmd_resp::new_error,
         metrics::*,
-        transport::SignificantRouter,
         unsafe_recovery::{
             UnsafeRecoveryExecutePlanSyncer, UnsafeRecoveryForceLeaderSyncer, UnsafeRecoveryHandle,
         },
@@ -69,7 +68,7 @@ use crate::{
             AutoSplitController, ReadStats, SplitConfigChange, WriteStats,
         },
         Callback, CasualMessage, Config, PeerMsg, RaftCmdExtraOpts, RaftCommand, RaftRouter,
-        RegionReadProgressRegistry, SignificantMsg, SnapManager, StoreInfo, StoreMsg, TxnExt,
+        RegionReadProgressRegistry, SnapManager, StoreInfo, StoreMsg, TxnExt,
     },
 };
 
@@ -142,6 +141,7 @@ where
         peer: metapb::Peer,
         // If true, right Region derives origin region_id.
         right_derive: bool,
+        share_source_region_size: bool,
         callback: Callback<EK::Snapshot>,
     },
     AskBatchSplit {
@@ -150,6 +150,7 @@ where
         peer: metapb::Peer,
         // If true, right Region derives origin region_id.
         right_derive: bool,
+        share_source_region_size: bool,
         callback: Callback<EK::Snapshot>,
     },
     AutoSplit {
@@ -659,7 +660,7 @@ where
                 // Register the region CPU records collector.
                 if auto_split_controller
                     .cfg
-                    .region_cpu_overload_threshold_ratio
+                    .region_cpu_overload_threshold_ratio()
                     > 0.0
                 {
                     region_cpu_records_collector =
@@ -1094,6 +1095,7 @@ where
         split_key: Vec<u8>,
         peer: metapb::Peer,
         right_derive: bool,
+        share_source_region_size: bool,
         callback: Callback<EK::Snapshot>,
         task: String,
     ) {
@@ -1115,6 +1117,7 @@ where
                         resp.get_new_region_id(),
                         resp.take_new_peer_ids(),
                         right_derive,
+                        share_source_region_size,
                     );
                     let region_id = region.get_id();
                     let epoch = region.take_region_epoch();
@@ -1149,6 +1152,7 @@ where
         mut split_keys: Vec<Vec<u8>>,
         peer: metapb::Peer,
         right_derive: bool,
+        share_source_region_size: bool,
         callback: Callback<EK::Snapshot>,
         task: String,
         remote: Remote<yatp::task::future::TaskCell>,
@@ -1174,6 +1178,7 @@ where
                         split_keys,
                         resp.take_ids().into(),
                         right_derive,
+                        share_source_region_size,
                     );
                     let region_id = region.get_id();
                     let epoch = region.take_region_epoch();
@@ -1202,6 +1207,7 @@ where
                         split_key: split_keys.pop().unwrap(),
                         peer,
                         right_derive,
+                        share_source_region_size,
                         callback,
                     };
                     if let Err(ScheduleError::Stopped(t)) = scheduler.schedule(task) {
@@ -1381,15 +1387,9 @@ where
         self.store_stat.region_bytes_read.flush();
         self.store_stat.region_keys_read.flush();
 
-        STORE_SIZE_GAUGE_VEC
-            .with_label_values(&["capacity"])
-            .set(capacity as i64);
-        STORE_SIZE_GAUGE_VEC
-            .with_label_values(&["available"])
-            .set(available as i64);
-        STORE_SIZE_GAUGE_VEC
-            .with_label_values(&["used"])
-            .set(used_size as i64);
+        STORE_SIZE_EVENT_INT_VEC.capacity.set(capacity as i64);
+        STORE_SIZE_EVENT_INT_VEC.available.set(available as i64);
+        STORE_SIZE_EVENT_INT_VEC.used.set(used_size as i64);
 
         let slow_score = self.slow_score.get();
         stats.set_slow_score(slow_score as u64);
@@ -1410,18 +1410,18 @@ where
                     }
                     if let Some(mut plan) = resp.recovery_plan.take() {
                         info!("Unsafe recovery, received a recovery plan");
+                        let handle = Arc::new(Mutex::new(router.clone()));
                         if plan.has_force_leader() {
                             let mut failed_stores = HashSet::default();
                             for failed_store in plan.get_force_leader().get_failed_stores() {
                                 failed_stores.insert(*failed_store);
                             }
-                            let router = Arc::new(Mutex::new(router.clone()));
                             let syncer = UnsafeRecoveryForceLeaderSyncer::new(
                                 plan.get_step(),
-                                router.clone(),
+                                handle.clone(),
                             );
                             for region in plan.get_force_leader().get_enter_force_leaders() {
-                                if let Err(e) = router.send_enter_force_leader(
+                                if let Err(e) = handle.send_enter_force_leader(
                                     *region,
                                     syncer.clone(),
                                     failed_stores.clone(),
@@ -1432,33 +1432,23 @@ where
                         } else {
                             let syncer = UnsafeRecoveryExecutePlanSyncer::new(
                                 plan.get_step(),
-                                Arc::new(Mutex::new(router.clone())),
+                                handle.clone(),
                             );
                             for create in plan.take_creates().into_iter() {
-                                if let Err(e) =
-                                    router.send_control(StoreMsg::UnsafeRecoveryCreatePeer {
-                                        syncer: syncer.clone(),
-                                        create,
-                                    })
-                                {
+                                if let Err(e) = handle.send_create_peer(create, syncer.clone()) {
                                     error!("fail to send create peer message for recovery"; "err" => ?e);
                                 }
                             }
                             for delete in plan.take_tombstones().into_iter() {
-                                if let Err(e) = router.significant_send(
-                                    delete,
-                                    SignificantMsg::UnsafeRecoveryDestroy(syncer.clone()),
-                                ) {
-                                    error!("fail to send delete peer message for recovery"; "err" => ?e);
+                                if let Err(e) = handle.send_destroy_peer(delete, syncer.clone()) {
+                                    error!("fail to send destroy peer message for recovery"; "err" => ?e);
                                 }
                             }
                             for mut demote in plan.take_demotes().into_iter() {
-                                if let Err(e) = router.significant_send(
+                                if let Err(e) = handle.send_demote_peers(
                                     demote.get_region_id(),
-                                    SignificantMsg::UnsafeRecoveryDemoteFailedVoters {
-                                        syncer: syncer.clone(),
-                                        failed_voters: demote.take_failed_voters().into_vec(),
-                                    },
+                                    demote.take_failed_voters().into_vec(),
+                                    syncer.clone(),
                                 ) {
                                     error!("fail to send update peer list message for recovery"; "err" => ?e);
                                 }
@@ -1703,6 +1693,7 @@ where
                             split_keys: split_region.take_keys().into(),
                             callback: Callback::None,
                             source: "pd".into(),
+                            share_source_region_size: false,
                         }
                     } else {
                         CasualMessage::HalfSplitRegion {
@@ -1735,7 +1726,7 @@ where
                     let mut switches = resp.take_switch_witnesses();
                     info!("try to switch witness";
                           "region_id" => region_id,
-                          "switch witness" => ?switches
+                          "switch_witness" => ?switches
                     );
                     let req = new_batch_switch_witness(switches.take_switch_witnesses().into());
                     send_admin_request(&router, region_id, epoch, peer, req, Callback::None, Default::default());
@@ -1760,10 +1751,7 @@ where
 
     fn handle_read_stats(&mut self, mut read_stats: ReadStats) {
         for (region_id, region_info) in read_stats.region_infos.iter_mut() {
-            let peer_stat = self
-                .region_peers
-                .entry(*region_id)
-                .or_insert_with(PeerStat::default);
+            let peer_stat = self.region_peers.entry(*region_id).or_default();
             peer_stat.read_bytes += region_info.flow.read_bytes as u64;
             peer_stat.read_keys += region_info.flow.read_keys as u64;
             self.store_stat.engine_total_bytes_read += region_info.flow.read_bytes as u64;
@@ -1785,10 +1773,7 @@ where
 
     fn handle_write_stats(&mut self, mut write_stats: WriteStats) {
         for (region_id, region_info) in write_stats.region_infos.iter_mut() {
-            let peer_stat = self
-                .region_peers
-                .entry(*region_id)
-                .or_insert_with(PeerStat::default);
+            let peer_stat = self.region_peers.entry(*region_id).or_default();
             peer_stat.query_stats.add_query_stats(&region_info.0);
             self.store_stat
                 .engine_total_query_num
@@ -2035,7 +2020,11 @@ where
     fn is_store_heartbeat_delayed(&self) -> bool {
         let now = UnixSecs::now();
         let interval_second = now.into_inner() - self.store_stat.last_report_ts.into_inner();
-        (interval_second >= self.store_heartbeat_interval.as_secs())
+        // Only if the `last_report_ts`, that is, the last timestamp of
+        // store_heartbeat, exceeds the interval of store heartbaet but less than
+        // the given limitation, will it trigger a report of fake heartbeat to
+        // make the statistics of slowness percepted by PD timely.
+        (interval_second > self.store_heartbeat_interval.as_secs())
             && (interval_second <= STORE_HEARTBEAT_DELAY_LIMIT)
     }
 
@@ -2102,12 +2091,14 @@ where
                 split_key,
                 peer,
                 right_derive,
+                share_source_region_size,
                 callback,
             } => self.handle_ask_split(
                 region,
                 split_key,
                 peer,
                 right_derive,
+                share_source_region_size,
                 callback,
                 String::from("ask_split"),
             ),
@@ -2116,6 +2107,7 @@ where
                 split_keys,
                 peer,
                 right_derive,
+                share_source_region_size,
                 callback,
             } => Self::handle_ask_batch_split(
                 self.router.clone(),
@@ -2125,6 +2117,7 @@ where
                 split_keys,
                 peer,
                 right_derive,
+                share_source_region_size,
                 callback,
                 String::from("batch_split"),
                 self.remote.clone(),
@@ -2138,7 +2131,10 @@ where
                 let f = async move {
                     for split_info in split_infos {
                         let Ok(Some(region)) =
-                            pd_client.get_region_by_id(split_info.region_id).await else { continue };
+                            pd_client.get_region_by_id(split_info.region_id).await
+                        else {
+                            continue;
+                        };
                         // Try to split the region with the given split key.
                         if let Some(split_key) = split_info.split_key {
                             Self::handle_ask_batch_split(
@@ -2149,6 +2145,7 @@ where
                                 vec![split_key],
                                 split_info.peer,
                                 true,
+                                false,
                                 Callback::None,
                                 String::from("auto_split"),
                                 remote.clone(),
@@ -2202,10 +2199,7 @@ where
                     cpu_usage,
                 ) = {
                     let region_id = hb_task.region.get_id();
-                    let peer_stat = self
-                        .region_peers
-                        .entry(region_id)
-                        .or_insert_with(PeerStat::default);
+                    let peer_stat = self.region_peers.entry(region_id).or_default();
                     peer_stat.approximate_size = approximate_size;
                     peer_stat.approximate_keys = approximate_keys;
 
@@ -2445,6 +2439,7 @@ fn new_split_region_request(
     new_region_id: u64,
     peer_ids: Vec<u64>,
     right_derive: bool,
+    share_source_region_size: bool,
 ) -> AdminRequest {
     let mut req = AdminRequest::default();
     req.set_cmd_type(AdminCmdType::Split);
@@ -2452,6 +2447,8 @@ fn new_split_region_request(
     req.mut_split().set_new_region_id(new_region_id);
     req.mut_split().set_new_peer_ids(peer_ids);
     req.mut_split().set_right_derive(right_derive);
+    req.mut_split()
+        .set_share_source_region_size(share_source_region_size);
     req
 }
 
@@ -2459,10 +2456,13 @@ fn new_batch_split_region_request(
     split_keys: Vec<Vec<u8>>,
     ids: Vec<pdpb::SplitId>,
     right_derive: bool,
+    share_source_region_size: bool,
 ) -> AdminRequest {
     let mut req = AdminRequest::default();
     req.set_cmd_type(AdminCmdType::BatchSplit);
     req.mut_splits().set_right_derive(right_derive);
+    req.mut_splits()
+        .set_share_source_region_size(share_source_region_size);
     let mut requests = Vec::with_capacity(ids.len());
     for (mut id, key) in ids.into_iter().zip(split_keys) {
         let mut split = SplitRequest::default();
@@ -2637,15 +2637,21 @@ fn collect_engine_size<EK: KvEngine, ER: RaftEngine>(
     } else {
         store_info.capacity
     };
-    let used_size = snap_mgr_size
-        + store_info
-            .kv_engine
-            .get_engine_used_size()
-            .expect("kv engine used size")
-        + store_info
-            .raft_engine
-            .get_engine_size()
-            .expect("raft engine used size");
+    let raft_size = store_info
+        .raft_engine
+        .get_engine_size()
+        .expect("raft engine used size");
+
+    let kv_size = store_info
+        .kv_engine
+        .get_engine_used_size()
+        .expect("kv engine used size");
+
+    STORE_SIZE_EVENT_INT_VEC.raft_size.set(raft_size as i64);
+    STORE_SIZE_EVENT_INT_VEC.snap_size.set(snap_mgr_size as i64);
+    STORE_SIZE_EVENT_INT_VEC.kv_size.set(kv_size as i64);
+
+    let used_size = snap_mgr_size + kv_size + raft_size;
     let mut available = capacity.checked_sub(used_size).unwrap_or_default();
     // We only care about rocksdb SST file size, so we should check disk available
     // here.

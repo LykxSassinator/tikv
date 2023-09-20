@@ -10,6 +10,8 @@
 
 #![allow(elided_lifetimes_in_paths)] // Necessary until rpn_fn accepts functions annotated with lifetimes.
 #![allow(incomplete_features)]
+#![allow(clippy::needless_raw_string_hashes)]
+#![allow(clippy::needless_return_with_question_mark)]
 #![feature(proc_macro_hygiene)]
 #![feature(specialization)]
 #![feature(test)]
@@ -631,6 +633,7 @@ fn map_expr_node_to_rpn_func(expr: &Expr) -> Result<RpnFnMeta> {
         ScalarFuncSig::JsonValidJsonSig => json_valid_fn_meta(),
         ScalarFuncSig::JsonValidStringSig => json_valid_fn_meta(),
         ScalarFuncSig::JsonValidOthersSig => json_valid_fn_meta(),
+        ScalarFuncSig::JsonMemberOfSig => member_of_fn_meta(),
         // impl_like
         ScalarFuncSig::LikeSig => map_like_sig(ft, children)?,
         // impl_regexp

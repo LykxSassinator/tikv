@@ -298,6 +298,8 @@ impl<EK: KvEngine> Runner<EK> {
             .spawn(async move {
                 let range1 = Range::new(&[], &start_key);
                 let range2 = Range::new(&end_key, keys::DATA_MAX_KEY);
+                // Note: Refer to https://github.com/facebook/rocksdb/pull/11468. There's could be
+                // some files missing from compaction if dynamic_level_bytes is off.
                 for r in [range1, range2] {
                     // When compaction filter is present, trivial move is disallowed.
                     if let Err(e) =
@@ -322,6 +324,16 @@ impl<EK: KvEngine> Runner<EK> {
                         }
                         return;
                     }
+                }
+                if let Err(e) = tablet.check_in_range(Some(&start_key), Some(&end_key)) {
+                    debug_assert!(false, "check_in_range failed {:?}, is titan enabled?", e);
+                    error!(
+                        logger,
+                        "trim did not remove all dirty data";
+                        "path" => tablet.path(),
+                        "err" => %e,
+                    );
+                    return;
                 }
                 // drop before callback.
                 drop(tablet);
@@ -455,7 +467,8 @@ impl<EK: KvEngine> Runner<EK> {
         let Some(Some(tablet)) = self
             .tablet_registry
             .get(region_id)
-            .map(|mut cache| cache.latest().cloned()) else {
+            .map(|mut cache| cache.latest().cloned())
+        else {
             warn!(
                 self.logger,
                 "flush memtable failed to acquire tablet";
@@ -543,7 +556,15 @@ impl<EK: KvEngine> Runner<EK> {
     }
 
     fn delete_range(&self, delete_range: Task<EK>) {
-        let Task::DeleteRange { region_id, tablet, cf, start_key, end_key, cb } = delete_range else {
+        let Task::DeleteRange {
+            region_id,
+            tablet,
+            cf,
+            start_key,
+            end_key,
+            cb,
+        } = delete_range
+        else {
             slog_panic!(self.logger, "unexpected task"; "task" => format!("{}", delete_range))
         };
 
@@ -578,6 +599,13 @@ impl<EK: KvEngine> Runner<EK> {
         // DeleteStrategy::DeleteBlobs));
 
         cb(written);
+    }
+}
+
+#[cfg(test)]
+impl<EK: KvEngine> Runner<EK> {
+    pub fn get_running_task_count(&self) -> usize {
+        self.low_pri_pool.get_running_task_count()
     }
 }
 
@@ -801,6 +829,14 @@ mod tests {
         runner.run(Task::destroy(r_1, 100));
         assert!(path.exists());
         registry.remove(r_1);
+        // waiting for async `pause_background_work` to be finished,
+        // this task can block tablet's destroy.
+        for _i in 0..100 {
+            if runner.get_running_task_count() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         runner.on_timeout();
         assert!(!path.exists());
         assert!(runner.pending_destroy_tasks.is_empty());

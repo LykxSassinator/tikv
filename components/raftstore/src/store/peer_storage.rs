@@ -96,7 +96,7 @@ impl PartialEq for SnapState {
             (&SnapState::Relax, &SnapState::Relax)
             | (&SnapState::ApplyAborted, &SnapState::ApplyAborted)
             | (&SnapState::Generating { .. }, &SnapState::Generating { .. }) => true,
-            (&SnapState::Applying(ref b1), &SnapState::Applying(ref b2)) => {
+            (SnapState::Applying(b1), SnapState::Applying(b2)) => {
                 b1.load(Ordering::Relaxed) == b2.load(Ordering::Relaxed)
             }
             _ => false,
@@ -1017,6 +1017,9 @@ where
         // The `region` is updated after persisting in order to stay consistent with the
         // one in `StoreMeta::regions` (will be updated soon).
         // See comments in `apply_snapshot` for more details.
+        (|| {
+            fail_point!("before_set_region_on_peer_3", self.peer_id == 3, |_| {});
+        })();
         self.set_region(res.region.clone());
     }
 }

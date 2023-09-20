@@ -9,7 +9,7 @@ use kvproto::pdpb;
 use pd_client::{
     metrics::{
         REGION_READ_BYTES_HISTOGRAM, REGION_READ_KEYS_HISTOGRAM, REGION_WRITTEN_BYTES_HISTOGRAM,
-        REGION_WRITTEN_KEYS_HISTOGRAM, STORE_SIZE_GAUGE_VEC,
+        REGION_WRITTEN_KEYS_HISTOGRAM, STORE_SIZE_EVENT_INT_VEC,
     },
     PdClient,
 };
@@ -263,15 +263,9 @@ where
         self.store_stat.region_bytes_read.flush();
         self.store_stat.region_keys_read.flush();
 
-        STORE_SIZE_GAUGE_VEC
-            .with_label_values(&["capacity"])
-            .set(capacity as i64);
-        STORE_SIZE_GAUGE_VEC
-            .with_label_values(&["available"])
-            .set(available as i64);
-        STORE_SIZE_GAUGE_VEC
-            .with_label_values(&["used"])
-            .set(used_size as i64);
+        STORE_SIZE_EVENT_INT_VEC.capacity.set(capacity as i64);
+        STORE_SIZE_EVENT_INT_VEC.available.set(available as i64);
+        STORE_SIZE_EVENT_INT_VEC.used.set(used_size as i64);
 
         // Update slowness statistics
         self.update_slowness_in_store_stats(&mut stats, last_query_sum);
@@ -285,8 +279,8 @@ where
                 Ok(mut resp) => {
                     // TODO: handle replication_status
 
-                    if let Some(plan) = resp.recovery_plan.take() {
-                        let router = Arc::new(UnsafeRecoveryRouter::new(router));
+                    if let Some(mut plan) = resp.recovery_plan.take() {
+                        let handle = Arc::new(UnsafeRecoveryRouter::new(router));
                         info!(logger, "Unsafe recovery, received a recovery plan");
                         if plan.has_force_leader() {
                             let mut failed_stores = HashSet::default();
@@ -295,10 +289,10 @@ where
                             }
                             let syncer = UnsafeRecoveryForceLeaderSyncer::new(
                                 plan.get_step(),
-                                router.clone(),
+                                handle.clone(),
                             );
                             for region in plan.get_force_leader().get_enter_force_leaders() {
-                                if let Err(e) = router.send_enter_force_leader(
+                                if let Err(e) = handle.send_enter_force_leader(
                                     *region,
                                     syncer.clone(),
                                     failed_stores.clone(),
@@ -309,9 +303,36 @@ where
                                 }
                             }
                         } else {
-                            let _syncer =
-                                UnsafeRecoveryExecutePlanSyncer::new(plan.get_step(), router);
-                            // TODO: handle creates/tombstone/demotes
+                            let syncer = UnsafeRecoveryExecutePlanSyncer::new(
+                                plan.get_step(),
+                                handle.clone(),
+                            );
+                            for create in plan.take_creates().into_iter() {
+                                if let Err(e) = handle.send_create_peer(create, syncer.clone()) {
+                                    error!(logger,
+                                        "fail to send create peer message for recovery";
+                                        "err" => ?e);
+                                }
+                            }
+                            for tombstone in plan.take_tombstones().into_iter() {
+                                if let Err(e) = handle.send_destroy_peer(tombstone, syncer.clone())
+                                {
+                                    error!(logger,
+                                        "fail to send destroy peer message for recovery";
+                                        "err" => ?e);
+                                }
+                            }
+                            for mut demote in plan.take_demotes().into_iter() {
+                                if let Err(e) = handle.send_demote_peers(
+                                    demote.get_region_id(),
+                                    demote.take_failed_voters().into_vec(),
+                                    syncer.clone(),
+                                ) {
+                                    error!(logger,
+                                        "fail to send update peer list message for recovery";
+                                        "err" => ?e);
+                                }
+                            }
                         }
                     }
 
@@ -387,7 +408,11 @@ where
         let now = UnixSecs::now();
         let interval_second = now.into_inner() - self.store_stat.last_report_ts.into_inner();
         let store_heartbeat_interval = std::cmp::max(self.store_heartbeat_interval.as_secs(), 1);
-        (interval_second >= store_heartbeat_interval)
+        // Only if the `last_report_ts`, that is, the last timestamp of
+        // store_heartbeat, exceeds the interval of store heartbaet but less than
+        // the given limitation, will it trigger a report of fake heartbeat to
+        // make the statistics of slowness percepted by PD timely.
+        (interval_second > store_heartbeat_interval)
             && (interval_second <= STORE_HEARTBEAT_DELAY_LIMIT)
             && (interval_second % store_heartbeat_interval == 0)
     }
@@ -442,12 +467,16 @@ where
             true
         });
         let snap_size = self.snap_mgr.total_snap_size().unwrap();
-        let used_size = snap_size
-            + kv_size
-            + self
-                .raft_engine
-                .get_engine_size()
-                .expect("raft engine used size");
+        let raft_size = self
+            .raft_engine
+            .get_engine_size()
+            .expect("engine used size");
+
+        STORE_SIZE_EVENT_INT_VEC.kv_size.set(kv_size as i64);
+        STORE_SIZE_EVENT_INT_VEC.raft_size.set(raft_size as i64);
+        STORE_SIZE_EVENT_INT_VEC.snap_size.set(snap_size as i64);
+
+        let used_size = snap_size + kv_size + raft_size;
         let mut available = capacity.checked_sub(used_size).unwrap_or_default();
         // We only care about rocksdb SST file size, so we should check disk available
         // here.

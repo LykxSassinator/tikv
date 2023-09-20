@@ -28,7 +28,7 @@ use backup_stream::{
     BackupStreamResolver,
 };
 use causal_ts::CausalTsProviderImpl;
-use cdc::{CdcConfigManager, MemoryQuota};
+use cdc::CdcConfigManager;
 use concurrency_manager::ConcurrencyManager;
 use engine_rocks::{from_rocks_compression_type, RocksEngine, RocksStatistics};
 use engine_rocks_helper::sst_recovery::{RecoveryRunner, DEFAULT_CHECK_INTERVAL};
@@ -105,9 +105,11 @@ use tikv::{
         Engine, Storage,
     },
 };
+use tikv_alloc::{add_thread_memory_accessor, remove_thread_memory_accessor};
 use tikv_util::{
     check_environment_variables,
     config::VersionTrack,
+    memory::MemoryQuota,
     mpsc as TikvMpsc,
     quota_limiter::{QuotaLimitConfigManager, QuotaLimiter},
     sys::{disk, path_in_diff_mount_point, register_memory_usage_high_water, SysQuota},
@@ -266,7 +268,7 @@ struct Servers<EK: KvEngine, ER: RaftEngine, F: KvFormat> {
     node: Node<RpcClient, EK, ER>,
     importer: Arc<SstImporter>,
     cdc_scheduler: tikv_util::worker::Scheduler<cdc::Task>,
-    cdc_memory_quota: MemoryQuota,
+    cdc_memory_quota: Arc<MemoryQuota>,
     rsmeter_pubsub_service: resource_metering::PubSubService,
     backup_stream_scheduler: Option<tikv_util::worker::Scheduler<backup_stream::Task>>,
     debugger: DebuggerImpl<ER, RaftKv<EK, ServerRaftStoreRouter<EK, ER>>, LockManager, F>,
@@ -293,6 +295,13 @@ where
             EnvBuilder::new()
                 .cq_count(config.server.grpc_concurrency)
                 .name_prefix(thd_name!(GRPC_THREAD_PREFIX))
+                .after_start(|| {
+                    // SAFETY: we will call `remove_thread_memory_accessor` at before_stop.
+                    unsafe { add_thread_memory_accessor() };
+                })
+                .before_stop(|| {
+                    remove_thread_memory_accessor();
+                })
                 .build(),
         );
         let pd_client = TikvServerCore::connect_to_pd_cluster(
@@ -956,6 +965,7 @@ where
             collector_reg_handle,
             self.causal_ts_provider.clone(),
             self.grpc_service_mgr.clone(),
+            safe_point.clone(),
         )
         .unwrap_or_else(|e| fatal!("failed to start node: {}", e));
 
@@ -985,7 +995,9 @@ where
         }
 
         // Start CDC.
-        let cdc_memory_quota = MemoryQuota::new(self.core.config.cdc.sink_memory_quota.0 as _);
+        let cdc_memory_quota = Arc::new(MemoryQuota::new(
+            self.core.config.cdc.sink_memory_quota.0 as _,
+        ));
         let cdc_endpoint = cdc::Endpoint::new(
             self.core.config.server.cluster_id,
             &self.core.config.cdc,
@@ -1307,7 +1319,7 @@ where
                     Err(e) => {
                         error!(
                             "get disk stat for kv store failed";
-                            "kv path" => store_path.to_str(),
+                            "kv_path" => store_path.to_str(),
                             "err" => ?e
                         );
                         return;
@@ -1333,7 +1345,7 @@ where
                         Err(e) => {
                             error!(
                                 "get disk stat for raft engine failed";
-                                "raft engine path" => raft_path.clone(),
+                                "raft_engine_path" => raft_path.clone(),
                                 "err" => ?e
                             );
                             return;
@@ -1548,7 +1560,11 @@ impl<CER: ConfiguredRaftEngine, F: KvFormat> TikvServer<CER, F> {
         let cfg_controller = self.cfg_controller.as_mut().unwrap();
         cfg_controller.register(
             tikv::config::Module::Rocksdb,
-            Box::new(DbConfigManger::new(kv_engine.clone(), DbType::Kv)),
+            Box::new(DbConfigManger::new(
+                cfg_controller.get_current().rocksdb,
+                kv_engine.clone(),
+                DbType::Kv,
+            )),
         );
         let reg = TabletRegistry::new(
             Box::new(SingletonFactory::new(kv_engine)),
@@ -1640,7 +1656,7 @@ mod test {
         // Prepare some data for two tablets of the same region. So we can test whether
         // we fetch the bytes from the latest one.
         for i in 1..21 {
-            tablet.put_cf(CF_DEFAULT, b"key", b"val").unwrap();
+            tablet.put_cf(CF_DEFAULT, b"zkey", b"val").unwrap();
             if i % 2 == 0 {
                 tablet.flush_cf(CF_DEFAULT, true).unwrap();
             }
@@ -1655,7 +1671,7 @@ mod test {
         tablet = cached.latest().unwrap();
 
         for i in 1..11 {
-            tablet.put_cf(CF_DEFAULT, b"key", b"val").unwrap();
+            tablet.put_cf(CF_DEFAULT, b"zkey", b"val").unwrap();
             if i % 2 == 0 {
                 tablet.flush_cf(CF_DEFAULT, true).unwrap();
             }

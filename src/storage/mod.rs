@@ -97,7 +97,7 @@ use tikv_util::{
     deadline::Deadline,
     future::try_poll,
     quota_limiter::QuotaLimiter,
-    time::{duration_to_ms, Instant, ThreadReadId},
+    time::{duration_to_ms, duration_to_sec, Instant, ThreadReadId},
 };
 use tracker::{
     clear_tls_tracker_token, set_tls_tracker_token, with_tls_tracker, TrackedFuture, TrackerToken,
@@ -601,6 +601,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         start_ts: TimeStamp,
     ) -> impl Future<Output = Result<(Option<Value>, KvGetStatistics)>> {
         let stage_begin_ts = Instant::now();
+        let deadline = Self::get_deadline(&ctx);
         const CMD: CommandKind = CommandKind::get;
         let priority = ctx.get_priority();
         let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
@@ -640,9 +641,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     .get(priority_tag)
                     .inc();
 
+                deadline.check()?;
+
                 Self::check_api_version(api_version, ctx.api_version, CMD, [key.as_encoded()])?;
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
 
                 // The bypass_locks and access_locks set will be checked at most once.
                 // `TsSet::vec` is more efficient here.
@@ -661,6 +664,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     Self::with_tls_engine(|engine| Self::snapshot(engine, snap_ctx)).await?;
 
                 {
+                    deadline.check()?;
                     let begin_instant = Instant::now();
                     let stage_snap_recv_ts = begin_instant;
                     let buckets = snapshot.ext().get_buckets();
@@ -693,12 +697,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         &statistics,
                         buckets.as_ref(),
                     );
+                    let now = Instant::now();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                         .get(CMD)
-                        .observe(begin_instant.saturating_elapsed_secs());
-                    SCHED_HISTOGRAM_VEC_STATIC
-                        .get(CMD)
-                        .observe(command_duration.saturating_elapsed_secs());
+                        .observe(duration_to_sec(
+                            now.saturating_duration_since(begin_instant),
+                        ));
+                    SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                        now.saturating_duration_since(command_duration),
+                    ));
 
                     let read_bytes = key.len()
                         + result
@@ -761,7 +768,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         ids: Vec<u64>,
         trackers: Vec<TrackerToken>,
         consumer: P,
-        begin_instant: tikv_util::time::Instant,
+        begin_instant: Instant,
     ) -> impl Future<Output = Result<()>> {
         const CMD: CommandKind = CommandKind::batch_get_command;
         // all requests in a batch have the same region, epoch, term, replica_read
@@ -801,7 +808,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 KV_COMMAND_KEYREAD_HISTOGRAM_STATIC
                     .get(CMD)
                     .observe(requests.len() as f64);
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
                 let read_id = Some(ThreadReadId::new());
                 let mut statistics = Statistics::default();
                 let mut req_snaps = vec![];
@@ -809,6 +816,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 for ((mut req, id), tracker) in requests.into_iter().zip(ids).zip(trackers) {
                     set_tls_tracker_token(tracker);
                     let mut ctx = req.take_context();
+                    let deadline = Self::get_deadline(&ctx);
                     let source = ctx.take_request_source();
                     let region_id = ctx.get_region_id();
                     let peer = ctx.get_peer();
@@ -867,6 +875,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         id,
                         source,
                         tracker,
+                        deadline,
                     ));
                 }
                 Self::with_tls_engine(|engine| engine.release_snapshot());
@@ -883,8 +892,14 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         id,
                         source,
                         tracker,
+                        deadline,
                     ) = req_snap;
                     let snap_res = snap.await;
+                    if let Err(e) = deadline.check() {
+                        consumer.consume(id, Err(Error::from(e)), begin_instant, source);
+                        continue;
+                    }
+
                     set_tls_tracker_token(tracker);
                     match snap_res {
                         Ok(snapshot) => Self::with_perf_context(CMD, || {
@@ -955,6 +970,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         start_ts: TimeStamp,
     ) -> impl Future<Output = Result<(Vec<Result<KvPair>>, KvGetStatistics)>> {
         let stage_begin_ts = Instant::now();
+        let deadline = Self::get_deadline(&ctx);
         const CMD: CommandKind = CommandKind::batch_get;
         let priority = ctx.get_priority();
         let metadata = TaskMetadata::from_ctx(ctx.get_resource_control_context());
@@ -997,6 +1013,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     .get(priority_tag)
                     .inc();
 
+                deadline.check()?;
+
                 Self::check_api_version(
                     api_version,
                     ctx.api_version,
@@ -1004,7 +1022,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     keys.iter().map(Key::as_encoded),
                 )?;
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
 
                 let bypass_locks = TsSet::from_u64s(ctx.take_resolved_locks());
                 let access_locks = TsSet::from_u64s(ctx.take_committed_locks());
@@ -1020,6 +1038,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 let snapshot =
                     Self::with_tls_engine(|engine| Self::snapshot(engine, snap_ctx)).await?;
                 {
+                    deadline.check()?;
                     let begin_instant = Instant::now();
 
                     let stage_snap_recv_ts = begin_instant;
@@ -1070,12 +1089,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         (result, stats)
                     });
                     metrics::tls_collect_scan_details(CMD, &stats);
+                    let now = Instant::now();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                         .get(CMD)
-                        .observe(begin_instant.saturating_elapsed_secs());
-                    SCHED_HISTOGRAM_VEC_STATIC
-                        .get(CMD)
-                        .observe(command_duration.saturating_elapsed_secs());
+                        .observe(duration_to_sec(
+                            now.saturating_duration_since(begin_instant),
+                        ));
+                    SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                        now.saturating_duration_since(command_duration),
+                    ));
 
                     let read_bytes = stats.cf_statistics(CF_DEFAULT).flow_stats.read_bytes
                         + stats.cf_statistics(CF_LOCK).flow_stats.read_bytes
@@ -1201,7 +1223,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 if reverse_scan {
                     std::mem::swap(&mut start_key, &mut end_key);
                 }
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
 
                 let bypass_locks = TsSet::from_u64s(ctx.take_resolved_locks());
                 let access_locks = TsSet::from_u64s(ctx.take_committed_locks());
@@ -1280,12 +1302,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         &statistics,
                         buckets.as_ref(),
                     );
+                    let now = Instant::now();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                         .get(CMD)
-                        .observe(begin_instant.saturating_elapsed_secs());
-                    SCHED_HISTOGRAM_VEC_STATIC
-                        .get(CMD)
-                        .observe(command_duration.saturating_elapsed_secs());
+                        .observe(duration_to_sec(
+                            now.saturating_duration_since(begin_instant),
+                        ));
+                    SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                        now.saturating_duration_since(command_duration),
+                    ));
 
                     res.map_err(Error::from).map(|results| {
                         KV_COMMAND_KEYREAD_HISTOGRAM_STATIC
@@ -1367,7 +1392,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 // which resolves locks on regions, and boundary of regions will be out of range
                 // of TiDB keys.
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
 
                 concurrency_manager.update_max_ts(max_ts);
                 let begin_instant = Instant::now();
@@ -1439,12 +1464,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         &statistics,
                         buckets.as_ref(),
                     );
+                    let now = Instant::now();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                         .get(CMD)
-                        .observe(begin_instant.saturating_elapsed_secs());
-                    SCHED_HISTOGRAM_VEC_STATIC
-                        .get(CMD)
-                        .observe(command_duration.saturating_elapsed_secs());
+                        .observe(duration_to_sec(
+                            now.saturating_duration_since(begin_instant),
+                        ));
+                    SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                        now.saturating_duration_since(command_duration),
+                    ));
 
                     Ok(locks)
                 })
@@ -1653,7 +1681,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
 
                 Self::check_api_version(api_version, ctx.api_version, CMD, [&key])?;
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
                 let snap_ctx = SnapContext {
                     pb_ctx: &ctx,
                     ..Default::default()
@@ -1688,12 +1716,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         &stats,
                         buckets.as_ref(),
                     );
+                    let now = Instant::now();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                         .get(CMD)
-                        .observe(begin_instant.saturating_elapsed_secs());
-                    SCHED_HISTOGRAM_VEC_STATIC
-                        .get(CMD)
-                        .observe(command_duration.saturating_elapsed_secs());
+                        .observe(duration_to_sec(
+                            now.saturating_duration_since(begin_instant),
+                        ));
+                    SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                        now.saturating_duration_since(command_duration),
+                    ));
                     r
                 }
             }
@@ -1760,7 +1791,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     .map_err(Error::from)?;
                 }
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
                 let read_id = Some(ThreadReadId::new());
                 let mut snaps = vec![];
                 for (mut req, id) in gets.into_iter().zip(ids) {
@@ -1829,12 +1860,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     }
                 }
 
+                let now = Instant::now();
                 SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                     .get(CMD)
-                    .observe(begin_instant.saturating_elapsed_secs());
-                SCHED_HISTOGRAM_VEC_STATIC
-                    .get(CMD)
-                    .observe(command_duration.saturating_elapsed_secs());
+                    .observe(duration_to_sec(
+                        now.saturating_duration_since(begin_instant),
+                    ));
+                SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                    now.saturating_duration_since(command_duration),
+                ));
                 Ok(())
             }
             .in_resource_metering_tag(resource_tag),
@@ -1880,7 +1914,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
 
                 Self::check_api_version(api_version, ctx.api_version, CMD, &keys)?;
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
                 let snap_ctx = SnapContext {
                     pb_ctx: &ctx,
                     ..Default::default()
@@ -1912,7 +1946,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                             key_ranges.push(build_key_range(k.as_encoded(), k.as_encoded(), false));
                             (k, v)
                         })
-                        .filter(|&(_, ref v)| !(v.is_ok() && v.as_ref().unwrap().is_none()))
+                        .filter(|(_, v)| !(v.is_ok() && v.as_ref().unwrap().is_none()))
                         .map(|(k, v)| match v {
                             Ok(v) => {
                                 let (user_key, _) = F::decode_raw_key_owned(k, false).unwrap();
@@ -1931,12 +1965,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     KV_COMMAND_KEYREAD_HISTOGRAM_STATIC
                         .get(CMD)
                         .observe(stats.data.flow_stats.read_keys as f64);
+                    let now = Instant::now();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                         .get(CMD)
-                        .observe(begin_instant.saturating_elapsed_secs());
-                    SCHED_HISTOGRAM_VEC_STATIC
-                        .get(CMD)
-                        .observe(command_duration.saturating_elapsed_secs());
+                        .observe(duration_to_sec(
+                            now.saturating_duration_since(begin_instant),
+                        ));
+                    SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                        now.saturating_duration_since(command_duration),
+                    ));
                     Ok(result)
                 }
             }
@@ -2012,7 +2049,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
             }
-            let command_duration = tikv_util::time::Instant::now();
+            let command_duration = Instant::now();
 
             if let Err(e) = Self::check_causal_ts_flushed(&mut ctx, CMD).await {
                 return callback(Err(e));
@@ -2124,7 +2161,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
             }
-            let command_duration = tikv_util::time::Instant::now();
+            let command_duration = Instant::now();
 
             if let Err(e) = Self::check_causal_ts_flushed(&mut ctx, CMD).await {
                 return callback(Err(e));
@@ -2189,7 +2226,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
             }
-            let command_duration = tikv_util::time::Instant::now();
+            let command_duration = Instant::now();
 
             if let Err(e) = Self::check_causal_ts_flushed(&mut ctx, CMD).await {
                 return callback(Err(e));
@@ -2250,7 +2287,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
             }
-            let command_duration = tikv_util::time::Instant::now();
+            let command_duration = Instant::now();
             let start_key = F::encode_raw_key_owned(start_key, None);
             let end_key = F::encode_raw_key_owned(end_key, None);
 
@@ -2298,7 +2335,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             if let Err(e) = deadline.check() {
                 return callback(Err(Error::from(e)));
             }
-            let command_duration = tikv_util::time::Instant::now();
+            let command_duration = Instant::now();
 
             if let Err(e) = Self::check_causal_ts_flushed(&mut ctx, CMD).await {
                 return callback(Err(e));
@@ -2384,7 +2421,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     [(Some(&start_key), end_key.as_ref())],
                 )?;
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
                 let snap_ctx = SnapContext {
                     pb_ctx: &ctx,
                     ..Default::default()
@@ -2461,12 +2498,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         .get(CMD)
                         .observe(statistics.data.flow_stats.read_keys as f64);
                     metrics::tls_collect_scan_details(CMD, &statistics);
+                    let now = Instant::now();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                         .get(CMD)
-                        .observe(begin_instant.saturating_elapsed_secs());
-                    SCHED_HISTOGRAM_VEC_STATIC
-                        .get(CMD)
-                        .observe(command_duration.saturating_elapsed_secs());
+                        .observe(duration_to_sec(
+                            now.saturating_duration_since(begin_instant),
+                        ));
+                    SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                        now.saturating_duration_since(command_duration),
+                    ));
 
                     result
                 }
@@ -2526,7 +2566,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         .map(|range| (Some(range.get_start_key()), Some(range.get_end_key()))),
                 )?;
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
                 let snap_ctx = SnapContext {
                     pb_ctx: &ctx,
                     ..Default::default()
@@ -2624,12 +2664,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         .get(CMD)
                         .observe(statistics.data.flow_stats.read_keys as f64);
                     metrics::tls_collect_scan_details(CMD, &statistics);
+                    let now = Instant::now();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                         .get(CMD)
-                        .observe(begin_instant.saturating_elapsed_secs());
-                    SCHED_HISTOGRAM_VEC_STATIC
-                        .get(CMD)
-                        .observe(command_duration.saturating_elapsed_secs());
+                        .observe(duration_to_sec(
+                            now.saturating_duration_since(begin_instant),
+                        ));
+                    SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                        now.saturating_duration_since(command_duration),
+                    ));
                     Ok(result)
                 }
             }
@@ -2674,7 +2717,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
 
                 Self::check_api_version(api_version, ctx.api_version, CMD, [&key])?;
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
                 let snap_ctx = SnapContext {
                     pb_ctx: &ctx,
                     ..Default::default()
@@ -2709,12 +2752,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         &stats,
                         buckets.as_ref(),
                     );
+                    let now = Instant::now();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                         .get(CMD)
-                        .observe(begin_instant.saturating_elapsed_secs());
-                    SCHED_HISTOGRAM_VEC_STATIC
-                        .get(CMD)
-                        .observe(command_duration.saturating_elapsed_secs());
+                        .observe(duration_to_sec(
+                            now.saturating_duration_since(begin_instant),
+                        ));
+                    SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                        now.saturating_duration_since(command_duration),
+                    ));
                     r
                 }
             }
@@ -2871,7 +2917,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     range.set_end_key(end_key.into_encoded());
                 }
 
-                let command_duration = tikv_util::time::Instant::now();
+                let command_duration = Instant::now();
                 let snap_ctx = SnapContext {
                     pb_ctx: &ctx,
                     ..Default::default()
@@ -2882,7 +2928,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 let store = RawStore::new(snapshot, api_version);
                 let cf = Self::rawkv_cf("", api_version)?;
 
-                let begin_instant = tikv_util::time::Instant::now();
+                let begin_instant = Instant::now();
                 let mut stats = Vec::with_capacity(ranges.len());
                 let ret = store
                     .raw_checksum_ranges(cf, &ranges, &mut stats)
@@ -2897,12 +2943,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         buckets.as_ref(),
                     );
                 });
+                let now = Instant::now();
                 SCHED_PROCESSING_READ_HISTOGRAM_STATIC
                     .get(CMD)
-                    .observe(begin_instant.saturating_elapsed().as_secs_f64());
-                SCHED_HISTOGRAM_VEC_STATIC
-                    .get(CMD)
-                    .observe(command_duration.saturating_elapsed().as_secs_f64());
+                    .observe(duration_to_sec(
+                        now.saturating_duration_since(begin_instant),
+                    ));
+                SCHED_HISTOGRAM_VEC_STATIC.get(CMD).observe(duration_to_sec(
+                    now.saturating_duration_since(command_duration),
+                ));
 
                 ret
             }
@@ -3679,7 +3728,7 @@ pub mod test_util {
             &self,
             id: u64,
             res: Result<(Option<Vec<u8>>, Statistics)>,
-            _: tikv_util::time::Instant,
+            _: Instant,
             _source: String,
         ) {
             self.data.lock().unwrap().push(GetResult {
@@ -3690,13 +3739,7 @@ pub mod test_util {
     }
 
     impl ResponseBatchConsumer<Option<Vec<u8>>> for GetConsumer {
-        fn consume(
-            &self,
-            id: u64,
-            res: Result<Option<Vec<u8>>>,
-            _: tikv_util::time::Instant,
-            _source: String,
-        ) {
+        fn consume(&self, id: u64, res: Result<Option<Vec<u8>>>, _: Instant, _source: String) {
             self.data.lock().unwrap().push(GetResult { id, res });
         }
     }
@@ -3849,9 +3892,9 @@ mod tests {
         let result = block_on(storage.get(Context::default(), Key::from_raw(b"x"), 100.into()));
         assert!(matches!(
             result,
-            Err(Error(box ErrorInner::Txn(txn::Error(
-                box txn::ErrorInner::Mvcc(mvcc::Error(box mvcc::ErrorInner::KeyIsLocked { .. }))
-            ))))
+            Err(Error(box ErrorInner::Txn(txn::Error(box txn::ErrorInner::Mvcc(mvcc::Error(
+                box mvcc::ErrorInner::KeyIsLocked { .. },
+            ))))))
         ));
     }
 
@@ -5701,7 +5744,7 @@ mod tests {
         ];
 
         // Write key-value pairs one by one
-        for &(ref key, ref value) in &test_data {
+        for (key, value) in &test_data {
             storage
                 .raw_put(
                     ctx.clone(),
@@ -5760,7 +5803,7 @@ mod tests {
         let mut total_bytes: u64 = 0;
         let mut is_first = true;
         // Write key-value pairs one by one
-        for &(ref key, ref value) in &test_data {
+        for (key, value) in &test_data {
             storage
                 .raw_put(
                     ctx.clone(),
@@ -6073,7 +6116,7 @@ mod tests {
 
     #[test]
     fn test_raw_batch_put() {
-        for for_cas in vec![false, true].into_iter() {
+        for for_cas in [false, true].into_iter() {
             test_kv_format_impl!(test_raw_batch_put_impl(for_cas));
         }
     }
@@ -6202,7 +6245,7 @@ mod tests {
         ];
 
         // Write key-value pairs one by one
-        for &(ref key, ref value) in &test_data {
+        for (key, value) in &test_data {
             storage
                 .raw_put(
                     ctx.clone(),
@@ -6217,7 +6260,7 @@ mod tests {
         }
 
         // Verify pairs in a batch
-        let keys = test_data.iter().map(|&(ref k, _)| k.clone()).collect();
+        let keys = test_data.iter().map(|(k, _)| k.clone()).collect();
         let results = test_data.into_iter().map(|(k, v)| Some((k, v))).collect();
         expect_multi_values(
             results,
@@ -6249,7 +6292,7 @@ mod tests {
         ];
 
         // Write key-value pairs one by one
-        for &(ref key, ref value) in &test_data {
+        for (key, value) in &test_data {
             storage
                 .raw_put(
                     ctx.clone(),
@@ -6267,7 +6310,7 @@ mod tests {
         let mut ids = vec![];
         let cmds = test_data
             .iter()
-            .map(|&(ref k, _)| {
+            .map(|(k, _)| {
                 let mut req = RawGetRequest::default();
                 req.set_context(ctx.clone());
                 req.set_key(k.clone());
@@ -6288,7 +6331,7 @@ mod tests {
 
     #[test]
     fn test_raw_batch_delete() {
-        for for_cas in vec![false, true].into_iter() {
+        for for_cas in [false, true].into_iter() {
             test_kv_format_impl!(test_raw_batch_delete_impl(for_cas));
         }
     }
@@ -6338,10 +6381,10 @@ mod tests {
         rx.recv().unwrap();
 
         // Verify pairs exist
-        let keys = test_data.iter().map(|&(ref k, _)| k.clone()).collect();
+        let keys = test_data.iter().map(|(k, _)| k.clone()).collect();
         let results = test_data
             .iter()
-            .map(|&(ref k, ref v)| Some((k.clone(), v.clone())))
+            .map(|(k, v)| Some((k.clone(), v.clone())))
             .collect();
         expect_multi_values(
             results,
@@ -6469,7 +6512,7 @@ mod tests {
         // Scan pairs with key only
         let mut results: Vec<Option<KvPair>> = test_data
             .iter()
-            .map(|&(ref k, _)| Some((k.clone(), vec![])))
+            .map(|(k, _)| Some((k.clone(), vec![])))
             .collect();
         expect_multi_values(
             results.clone(),
@@ -6866,7 +6909,7 @@ mod tests {
         rx.recv().unwrap();
 
         // Verify pairs exist
-        let keys = test_data.iter().map(|&(ref k, _)| k.clone()).collect();
+        let keys = test_data.iter().map(|(k, _)| k.clone()).collect();
         let results = test_data.into_iter().map(|(k, v)| Some((k, v))).collect();
         expect_multi_values(
             results,

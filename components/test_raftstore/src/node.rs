@@ -2,7 +2,7 @@
 
 use std::{
     path::Path,
-    sync::{Arc, Mutex, RwLock},
+    sync::{atomic::AtomicU64, Arc, Mutex, RwLock},
 };
 
 use collections::{HashMap, HashSet};
@@ -281,7 +281,7 @@ impl Simulator for NodeCluster {
             (snap_mgr, Some(tmp))
         } else {
             let trans = self.trans.core.lock().unwrap();
-            let &(ref snap_mgr, _) = &trans.snap_paths[&node_id];
+            let (snap_mgr, _) = &trans.snap_paths[&node_id];
             (snap_mgr.clone(), None)
         };
 
@@ -335,6 +335,7 @@ impl Simulator for NodeCluster {
             CollectorRegHandle::new_for_test(),
             None,
             GrpcServiceManager::dummy(),
+            Arc::new(AtomicU64::new(0)),
         )?;
         assert!(
             engines

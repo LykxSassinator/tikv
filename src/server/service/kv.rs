@@ -889,7 +889,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         forward_duplex!(self.proxy, batch_commands, ctx, stream, sink);
 
         let (tx, rx) = unbounded(WakePolicy::TillReach(GRPC_MSG_NOTIFY_SIZE));
-        let ctx = Arc::new(ctx);
         let peer = ctx.peer();
         let storage = self.storage.clone();
         let copr = self.copr.clone();
@@ -2300,11 +2299,11 @@ fn needs_reject_raft_append(reject_messages_on_memory_ratio: f64) -> bool {
         {
             // FIXME: this doesn't output to logfile.
             debug!("need reject log append on memory limit";
-                "raft messages" => raft_msg_usage,
-                "cached entries" => cached_entries,
-                "applying entries" => applying_entries,
-                "current usage" => usage,
-                "reject ratio" => reject_messages_on_memory_ratio);
+                "raft_messages" => raft_msg_usage,
+                "cached_entries" => cached_entries,
+                "applying_entries" => applying_entries,
+                "current_usage" => usage,
+                "reject_ratio" => reject_messages_on_memory_ratio);
             return true;
         }
     }

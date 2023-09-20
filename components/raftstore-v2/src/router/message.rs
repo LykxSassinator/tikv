@@ -15,8 +15,8 @@ use kvproto::{
 use raftstore::store::{
     fsm::ChangeObserver, metrics::RaftEventDurationType, simple_write::SimpleWriteBinary,
     util::LatencyInspector, FetchedLogs, GenSnapRes, TabletSnapKey,
-    UnsafeRecoveryFillOutReportSyncer, UnsafeRecoveryForceLeaderSyncer,
-    UnsafeRecoveryWaitApplySyncer,
+    UnsafeRecoveryExecutePlanSyncer, UnsafeRecoveryFillOutReportSyncer,
+    UnsafeRecoveryForceLeaderSyncer, UnsafeRecoveryWaitApplySyncer,
 };
 use resource_control::ResourceMetered;
 use tikv_util::time::Instant;
@@ -264,6 +264,15 @@ pub enum PeerMsg {
     UnsafeRecoveryWaitApply(UnsafeRecoveryWaitApplySyncer),
     /// Wait for a peer to fill its status to the report.
     UnsafeRecoveryFillOutReport(UnsafeRecoveryFillOutReportSyncer),
+    /// Wait for a peer to be initialized.
+    UnsafeRecoveryWaitInitialized(UnsafeRecoveryExecutePlanSyncer),
+    /// Destroy a peer.
+    UnsafeRecoveryDestroy(UnsafeRecoveryExecutePlanSyncer),
+    // Demote failed voter peers.
+    UnsafeRecoveryDemoteFailedVoters {
+        failed_voters: Vec<metapb::Peer>,
+        syncer: UnsafeRecoveryExecutePlanSyncer,
+    },
 }
 
 impl ResourceMetered for PeerMsg {}
@@ -306,6 +315,7 @@ impl PeerMsg {
         epoch: metapb::RegionEpoch,
         split_keys: Vec<Vec<u8>>,
         source: String,
+        share_source_region_size: bool,
     ) -> (Self, CmdResSubscriber) {
         let (ch, sub) = CmdResChannel::pair();
         (
@@ -314,6 +324,7 @@ impl PeerMsg {
                     epoch,
                     split_keys,
                     source: source.into(),
+                    share_source_region_size,
                 },
                 ch,
             },
@@ -335,6 +346,7 @@ impl PeerMsg {
                     epoch,
                     split_keys,
                     source: source.into(),
+                    share_source_region_size: false,
                 },
                 ch,
             },
@@ -366,6 +378,11 @@ pub enum StoreMsg {
     },
     /// Send a store report for unsafe recovery.
     UnsafeRecoveryReport(pdpb::StoreReport),
+    /// Create a peer for unsafe recovery.
+    UnsafeRecoveryCreatePeer {
+        region: metapb::Region,
+        syncer: UnsafeRecoveryExecutePlanSyncer,
+    },
 }
 
 impl ResourceMetered for StoreMsg {}
