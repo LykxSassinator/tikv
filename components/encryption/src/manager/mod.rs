@@ -339,7 +339,7 @@ impl Dicts {
                         }
                     }
                     Err(e) => {
-                        warn!("data key rotate duraion overflow, generate a new data key";
+                        warn!("data key rotate duration overflow, generate a new data key";
                             "now" => ?now, "creation_time" => ?creation_time, "error" => ?e);
                     }
                 }
@@ -1010,6 +1010,8 @@ impl<'a> DataKeyImporter<'a> {
                     let id = OsRng.next_u64();
                     if let Entry::Vacant(e) = key_dict.keys.entry(id) {
                         key_id = Some(id);
+                        // FIXME: the updating to `key_dict_file` should be flushed before flushing
+                        // `file_dict_file`.
                         e.insert(new_key);
                         self.key_additions.push(id);
                         info!("generate new ID for imported key"; "id" => id, "fname" => fname);
