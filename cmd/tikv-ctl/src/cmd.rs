@@ -90,11 +90,18 @@ pub struct Opt {
         conflicts_with_all = &["hex-to-escaped", "escaped-to-hex"],
         long,
     )]
+    /// Convert an [u8] array to hex key
+    pub u8_to_hex: Option<String>,
+
+    #[structopt(
+        conflicts_with_all = &["hex-to-escaped", "escaped-to-hex", "u8-to-hex"],
+        long,
+    )]
     /// Decode a key in escaped format
     pub decode: Option<String>,
 
     #[structopt(
-        conflicts_with_all = &["hex-to-escaped", "escaped-to-hex"],
+        conflicts_with_all = &["hex-to-escaped", "escaped-to-hex", "u8-to-hex"],
         long,
     )]
     /// Encode a key in escaped format

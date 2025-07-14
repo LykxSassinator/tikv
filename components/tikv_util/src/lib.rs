@@ -240,6 +240,39 @@ pub fn unescape(s: &str) -> Vec<u8> {
     buf
 }
 
+/// Converts a string input from standard input (formatted as "[u8, u8, ...]")
+/// to a Vec<u8>.
+///
+/// # Description
+/// This function reads a line from standard input, trims the surrounding square
+/// brackets, splits the string by commas, parses each element to u8, and
+/// collects the results into a Vec<u8>.
+///
+/// # Example Input
+/// "[122, 116, 128, 0, 0, 0, 0, 0, 0, 255, 139, 95, 114, 128, 0, 0, 0, 1, 255,
+/// 201, 253, 89, 0, 0, 0, 0, 0, 250, 249, 160, 53, 12, 160, 119, 255, 247]"
+///
+/// # Returns
+/// A Vec<u8> containing the parsed byte values.
+///
+/// # Errors
+/// Returns an error if:
+/// - Input cannot be read from stdin.
+/// - Any element cannot be parsed to u8 (e.g., value > 255 or non-numeric
+///   characters).
+pub fn str_to_u8_arr(input: &str) -> Result<Vec<u8>, std::io::Error> {
+    // Remove the surrounding square brackets
+    let cleaned = input.trim_matches(|c| c == '[' || c == ']');
+    // Split the content by commas and parse each element to u8
+    let u8_vec: Result<Vec<u8>, _> = cleaned
+        .split(',')
+        .map(|s|
+        // Trim any spaces around the number (e.g., " 122 " -> "122")
+        s.trim().parse())
+        .collect();
+    u8_vec.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// A helper trait for `Entry` to accept a failable closure.
 pub trait TryInsertWith<'a, V, E> {
     fn or_try_insert_with<F: FnOnce() -> Result<V, E>>(self, default: F) -> Result<&'a mut V, E>;
@@ -907,6 +940,32 @@ mod tests {
         // Hex Octals
         assert_eq!(unescape(r"abc\x64\x65\x66ghi"), b"abcdefghi");
         assert_eq!(unescape(r"JKL\x4d\x4E\x4fPQR"), b"JKLMNOPQR");
+    }
+
+    #[test]
+    fn test_str_to_u8_arr() {
+        let target: Vec<u8> = vec![
+            122, 116, 128, 0, 0, 0, 0, 0, 0, 255, 139, 95, 114, 128, 0, 0, 0, 1, 255, 201, 221,
+            139, 0, 0, 0, 0, 0, 250, 249, 160, 53, 12, 160, 119, 255, 247,
+        ];
+        let string: Vec<String> = target
+            .clone()
+            .into_iter()
+            .map(|ele| format!("{}", ele))
+            .collect();
+        let mut concat_str = string.join(",");
+        let u8_arr = str_to_u8_arr(&concat_str).unwrap();
+        assert_eq!(target, u8_arr);
+        // Push "[" to the head of the string.
+        concat_str.insert(0, '[');
+        assert_eq!(str_to_u8_arr(&concat_str).unwrap(), u8_arr);
+        // Push "]" to the tail of the string.
+        concat_str.push(']');
+        assert_eq!(str_to_u8_arr(&concat_str).unwrap(), u8_arr);
+        // Push an invalid element and parse it with err returned.
+        concat_str.pop();
+        concat_str.push_str(", 345]");
+        let _ = str_to_u8_arr(&concat_str).unwrap_err();
     }
 
     #[test]

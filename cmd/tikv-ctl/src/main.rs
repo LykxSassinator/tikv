@@ -58,7 +58,7 @@ use tikv::{
 use tikv_util::{
     escape,
     logger::{Level, get_log_level},
-    run_and_wait_child_process,
+    run_and_wait_child_process, str_to_u8_arr,
     sys::thread::StdThreadBuildWrapper,
     unescape, warn,
 };
@@ -108,6 +108,11 @@ fn main() {
                 println!("{}", escape(&from_hex(hex).unwrap()));
             } else if let Some(escaped) = opt.escaped_to_hex.as_deref() {
                 println!("{}", hex::encode_upper(unescape(escaped)));
+            } else if let Some(arr) = opt.u8_to_hex.as_deref() {
+                match str_to_u8_arr(arr) {
+                    Ok(arr) => println!("{}", hex::encode_upper(arr)),
+                    Err(e) => println!("u8-to-hex meets error: {}", e),
+                }
             } else if let Some(encoded) = opt.decode.as_deref() {
                 match Key::from_encoded(unescape(encoded)).into_raw() {
                     Ok(k) => println!("{}", escape(&k)),
